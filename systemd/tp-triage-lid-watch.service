@@ -1,0 +1,13 @@
+# Opening the lid is neither a udev nor a systemd event, so this stays
+# running, reads the lid switch and starts tp-triage.service each
+# time the lid is opened. It sleeps in between.
+[Unit]
+Description=Check the LG Gram ELAN touchpad when the lid is opened
+
+[Service]
+ExecStart=/usr/local/sbin/tp-triage --watch-lid
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

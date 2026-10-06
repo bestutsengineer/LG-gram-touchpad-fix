@@ -1,0 +1,1037 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# tp-triage -- wake, rebind and triage the ELAN touchpad of the LG Gram 16Z90P
+# (ELAN0E03:00 / 04F3:3191, address 0x15 on i2c-0 behind Intel LPSS 0000:00:15.0).
+#
+#   tp-triage                interactive: diagnose, recover, confirm with a finger test
+#   tp-triage --status       read-only state (no root needed)
+#   tp-triage --auto         recover without prompts if the touchpad needs it, else do
+#                            nothing; what tp-triage.service runs
+#   tp-triage --watch-lid    stay running and start that unit whenever the lid is
+#                            opened; what tp-triage-lid-watch.service runs
+#   --force                  recover even if the touchpad looks fine
+#   --suspend[=N]            with --auto: if still dead, suspend 10 minutes and retry (N times)
+#   --test-notify            show the desktop notification an unattended recovery sends
+#
+# After a long suspend, at a cold boot and now and then when the lid is opened
+# on a laptop that stayed awake, the chip does not answer at 0x15 and holds
+# its interrupt line low until it is addressed at 0x00. This script does that
+# wake and (re)binds the driver.
+# How it works, the evidence and the things that will bite: README.md and
+# docs/DESIGN.md in the source repository.
+#
+# shellcheck disable=SC2329  # functions are called through step() and traps
+
+DEV=i2c-ELAN0E03:00
+DRV=/sys/bus/i2c/drivers/i2c_hid_acpi
+I2CDEV=/sys/bus/i2c/devices/$DEV
+LPSS=0000:00:15.0
+PCI_PATH=/sys/bus/pci/devices/$LPSS
+PCI_DRV=/sys/bus/pci/drivers/intel-lpss
+BUS=0
+ADDR=0x15
+MODEL=16Z90P-G.AA54A
+UNIT=tp-triage.service
+WATCH_UNIT=tp-triage-lid-watch.service
+INSTALLED=/usr/local/sbin/tp-triage
+# Exists while a failed recovery has been reported and not been fixed since.
+REPORTED=/run/lock/tp-triage.reported
+LOG_FILE=/dev/null
+KEEP_LOGS=200
+
+# Finger-test calibration from this machine: a finger makes about 120
+# interrupts a second, the storm of a dead chip about 5,000 a second.
+IDLE_SECONDS=${TP_TRIAGE_IDLE_SECONDS:-1}
+ACTIVE_SECONDS=${TP_TRIAGE_ACTIVE_SECONDS:-5}
+MAX_IDLE_INTERRUPTS=${TP_TRIAGE_MAX_IDLE_INTERRUPTS:-500}
+MIN_ACTIVE_INTERRUPTS=${TP_TRIAGE_MIN_ACTIVE_INTERRUPTS:-20}
+
+# Length of the power-cycling suspend; see suspend_reroll for why 10 minutes.
+SUSPEND_SECONDS=${TP_TRIAGE_SUSPEND_SECONDS:-600}
+
+# After the lid opens the touchpad is checked at once and again this much later.
+LID_RECHECK_SECONDS=${TP_TRIAGE_LID_RECHECK_SECONDS:-10}
+
+usage() {
+  cat <<'EOF'
+Usage: tp-triage [--status | --auto | --watch-lid] [--force] [--suspend[=N]]
+
+  (no option)    interactive triage: state, recovery ladder, finger test
+  --status       read-only state; no root needed
+  --auto         no prompts: if the touchpad is unbound, storming, or its last
+                 resume failed, wake the chip and (re)bind it; otherwise exit
+                 at once without logging. Run by the unit at boot, after
+                 resume and when the lid is opened. (--boot is accepted as an
+                 old name for it.)
+  --watch-lid    stay running; start the unit each time the lid is opened
+  --force        recover even if the touchpad looks fine
+  --suspend[=N]  with --auto: if the chip is still dead, also suspend for 10
+                 minutes (wakes itself) and retry, up to N times (default 1).
+                 The interactive ladder asks before each suspend instead.
+  --test-notify  show the desktop notification and exit
+
+An --auto run that finds the touchpad faulty (failed resume, interrupt storm,
+silent chip) sends one desktop notification saying whether its first recovery
+attempt worked. A healthy touchpad, or one that only needed its driver bound,
+sends none, and a failure that was already reported is not reported twice.
+
+The interactive ladder, most successful step first:
+  1. wake the chip through I2C address 0x00, then bind      (automatic)
+  2. cycle the I2C controller driver, wake, bind            (automatic)
+  3. suspend for 10 minutes to power-cycle the chip         (asks)
+  4. reload the i2c_hid modules                             (asks)
+  5. remove and rescan the I2C controller on the PCI bus    (asks)
+
+Exit: 0 working (or nothing to do), 1 not recovered, 130 interrupted, 64 usage,
+      65 wrong machine, 75 another run is in progress.
+EOF
+}
+
+MODE=interactive
+FORCE=0
+REROLLS=0
+for arg in "$@"; do
+  case $arg in
+    --status)  MODE=status ;;
+    --auto|--boot) MODE=auto ;;
+    --watch-lid) MODE=watch ;;
+    --force)   FORCE=1 ;;
+    --suspend)   REROLLS=1 ;;
+    --suspend=*) REROLLS=${arg#--suspend=} ;;
+    --test-notify) MODE=notify ;;
+    -h|--help) usage; exit 0 ;;
+    *)         usage >&2; exit 64 ;;
+  esac
+done
+
+if [ -t 1 ]; then
+  R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; B=$'\e[1m'; N=$'\e[0m'
+else
+  R=; G=; Y=; B=; N=
+fi
+
+# Under the unit stdout and stderr already are the journal; logger would
+# duplicate every line. (fd 3 is this script's stderr: inside $() stdout is
+# the pipe, and stat's own stderr is sent to /dev/null.)
+USE_LOGGER=1
+[ -n "$JOURNAL_STREAM" ] && [ "$JOURNAL_STREAM" = "$(stat -Lc '%d:%i' /dev/fd/3 3>&2 2>/dev/null)" ] && USE_LOGGER=0
+
+# Passive snapshots go into the log only when something was actually wrong;
+# a plain bind at boot stays a few lines.
+FORENSIC=1
+[ "$MODE" = auto ] && FORENSIC=0
+
+ask() {
+  local a question=$1
+  if { exec 3<>/dev/tty; } 2>/dev/null; then
+    printf '%s' "$Y-> $1 [Y/n] $N" >&3; read -r a <&3 || a=n; exec 3<&-
+  else
+    printf '%s' "$Y-> $1 [Y/n] $N"; read -r a || a=n
+  fi
+  if [ -z "$a" ] || [ "$a" = y ] || [ "$a" = Y ]; then
+    log_event "prompt question=[$question] decision=yes"
+    return 0
+  fi
+  log_event "prompt question=[$question] decision=no"
+  return 1
+}
+
+acpi_node()   { readlink -f "$I2CDEV/firmware_node" 2>/dev/null; }
+bound()       { [ -L "$I2CDEV/driver" ]; }
+haveinput()   { grep -q 'ELAN0E03.*Touchpad' /proc/bus/input/devices; }
+fixed()       { bound && haveinput; }
+modloaded()   { [ -d /sys/module/i2c_hid_acpi ]; }
+pci_attr()    { cat "$PCI_PATH/$1" 2>/dev/null || echo unavailable; }
+
+log_event() {
+  local message=$*
+  [ "$MODE" = status ] && return 0
+  printf '[%s] %s\n' "$(date --iso-8601=seconds)" "$message"
+  [ "$USE_LOGGER" -eq 1 ] && logger -t tp-triage -- "$message" 2>/dev/null
+  return 0
+}
+
+# One desktop notification to whoever is logged in at the screen. The unit
+# runs as root, so it goes through that user's session bus; before anyone has
+# logged in there is nobody to tell.
+notify_user() { # notify_user <urgency> <title> <body>
+  local urgency=$1 title=$2 body=$3 sid uid user rc
+  local -a cmd=(notify-send --app-name=Touchpad --icon=input-touchpad "--urgency=$urgency" --expire-time=15000 "$title" "$body")
+  command -v notify-send >/dev/null || { log_event "notify skipped reason=no_notify-send"; return 0; }
+  if [ "$(id -u)" -ne 0 ]; then
+    "${cmd[@]}"
+    return
+  fi
+  for sid in $(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $1}'); do
+    [ "$(loginctl show-session "$sid" -p Active --value 2>/dev/null)" = yes ] || continue
+    [ "$(loginctl show-session "$sid" -p Class --value 2>/dev/null)" = user ] || continue
+    case "$(loginctl show-session "$sid" -p Type --value 2>/dev/null)" in wayland|x11) ;; *) continue ;; esac
+    uid=$(loginctl show-session "$sid" -p User --value 2>/dev/null)
+    user=$(loginctl show-session "$sid" -p Name --value 2>/dev/null)
+    [ -S "/run/user/$uid/bus" ] || continue
+    runuser -u "$user" -- env "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus" "${cmd[@]}" >> "$LOG_FILE" 2>&1
+    rc=$?
+    log_event "notify user=$user urgency=$urgency title=[$title] rc=$rc"
+    return 0
+  done
+  log_event "notify skipped reason=no_active_desktop_session"
+}
+
+# The single notification of an unattended run. Sent after the first recovery
+# attempt, so it can say how that went, and only when the touchpad was really
+# faulty: binding a driver that was merely not bound is not worth a popup.
+# Several triggers can run this for one fault (a resume and the lid, say), so
+# a failure that has been reported is not reported again until the touchpad
+# has been seen working.
+notify_fault() {
+  [ -n "$FAULT" ] || return 0
+  if fixed; then
+    rm -f "$REPORTED"
+    notify_user normal "Touchpad recovered" \
+      "The touchpad was dead: $FAULT. tp-triage woke the chip and rebound the driver."
+  elif [ -e "$REPORTED" ]; then
+    log_event "notify skipped reason=already_reported"
+  else
+    : > "$REPORTED"
+    notify_user critical "Touchpad not responding" \
+      "The touchpad is dead: $FAULT. tp-triage is still trying; if the pointer stays dead, run tp-triage in a terminal."
+  fi
+}
+
+irq_total() {
+  awk '
+    /ELAN0E03:00/ {
+      sum=0
+      for (i=2; i<=NF; i++) if ($i ~ /^[0-9]+$/) sum += $i
+      print sum
+      found=1
+      exit
+    }
+    END { if (!found) exit 1 }
+  ' /proc/interrupts
+}
+
+touchpad_event_node() {
+  awk '
+    BEGIN { RS="" }
+    /ELAN0E03:00 04F3:3191 Touchpad/ {
+      for (i=1; i<=NF; i++) {
+        if ($i ~ /^event[0-9]+$/) {
+          print "/dev/input/" $i
+          exit
+        }
+      }
+    }
+  ' /proc/bus/input/devices
+}
+
+# The touchpad's interrupt pad (PCH pin 179, IRQ 118), read from pinctrl
+# debugfs. A healthy idle touchpad reads "high". A chip that has not started
+# holds it "low"; under a bound driver that stuck line is the interrupt storm.
+int_level() {
+  awk '$1 == "pin" && $2 == 179 { v = strtonum($6); print (and(v, 2) ? "high" : "low"); f = 1 }
+       END { if (!f) print "unknown" }' /sys/kernel/debug/pinctrl/INT34C5:00/pins 2>/dev/null \
+    || echo unknown
+}
+
+# Count touchpad interrupts for up to <seconds>, recording what libinput sees
+# into the log. With <enough> above 0 it stops as soon as that many interrupts
+# have arrived, so a working touchpad is confirmed in a fraction of a second.
+# Leaves the results in WATCH_DELTA and FINGER_EVENTS.
+WATCH_PID=
+watch_activity() { # watch_activity <phase> <seconds> <enough>
+  local phase=$1 seconds=$2 enough=$3 node cap='' a b i
+  WATCH_DELTA=0
+  FINGER_EVENTS=unknown
+  a=$(irq_total) || return 1
+  node=$(touchpad_event_node)
+  if command -v libinput >/dev/null && [ -n "$node" ] && [ -r "$node" ] \
+    && cap=$(mktemp "$LOG_DIR/.capture.XXXXXX" 2>/dev/null); then
+    stdbuf -oL -eL libinput debug-events --device "$node" > "$cap" 2>&1 &
+    WATCH_PID=$!
+  fi
+  for (( i = 0; i < seconds * 5; i++ )); do
+    sleep 0.2
+    b=$(irq_total) || break
+    WATCH_DELTA=$(( b - a ))
+    [ "$enough" -gt 0 ] && [ "$WATCH_DELTA" -ge "$enough" ] && break
+  done
+  if [ -n "$WATCH_PID" ]; then
+    kill "$WATCH_PID" 2>/dev/null; wait "$WATCH_PID" 2>/dev/null
+    WATCH_PID=
+    FINGER_EVENTS=$(grep -cE 'POINTER_|TOUCH_|GESTURE_' "$cap")
+    {
+      printf '\n===== LIBINPUT CAPTURE: %s node=%s (%s) =====\n' "$phase" "$node" "$(date --iso-8601=ns)"
+      head -n 2000 "$cap"
+      printf '===== END LIBINPUT CAPTURE: %s finger_events=%s =====\n\n' "$phase" "$FINGER_EVENTS"
+    } >> "$LOG_FILE"
+    rm -f "$cap"
+  fi
+  [ -n "$b" ] || return 1
+  log_event "watch phase=$phase window=${seconds}s interrupts=$WATCH_DELTA finger_events=$FINGER_EVENTS"
+}
+
+dump_snapshot() {
+  local reason=$1 f irq path
+  [ "$FORENSIC" -eq 1 ] || return 0
+  f=$(acpi_node)
+  irq=$(awk '/ELAN0E03:00/{print $1; exit}' /proc/interrupts | tr -d ':')
+  {
+    printf '\n===== PASSIVE SNAPSHOT: %s (%s) =====\n' "$reason" "$(date --iso-8601=ns)"
+    printf 'kernel: '; uname -a
+    printf 'uptime: '; cat /proc/uptime
+    printf 'boot_id: '; cat /proc/sys/kernel/random/boot_id 2>/dev/null
+    printf 'i2c_client: '; [ -e "$I2CDEV" ] && echo present || echo missing
+    printf 'driver: '; readlink -f "$I2CDEV/driver" 2>/dev/null || echo none
+    printf 'firmware_node: %s\n' "${f:-none}"
+    printf '_STA: '; cat "$f/status" 2>/dev/null || echo unavailable
+    printf 'ACPI_power: '; cat "$f/power_state" 2>/dev/null || echo unavailable
+    for path in \
+      "$I2CDEV/power/control" \
+      "$I2CDEV/power/runtime_status" \
+      "$I2CDEV/power/wakeup" \
+      "$PCI_PATH/power/control" \
+      "$PCI_PATH/power/runtime_status" \
+      "$PCI_PATH/power_state"; do
+      printf '%s: ' "$path"
+      cat "$path" 2>/dev/null || echo unavailable
+    done
+    echo '-- ELAN interrupt line --'
+    grep 'ELAN0E03:00' /proc/interrupts 2>/dev/null || echo absent
+    echo '-- PCH pads: interrupt (179), I2C0 SDA/SCL (187, 188) --'
+    printf 'INT level: %s\n' "$(int_level)"
+    grep -E '^pin (179|187|188) ' /sys/kernel/debug/pinctrl/INT34C5:00/pins 2>/dev/null || echo unavailable
+    if [ -n "$irq" ]; then
+      for path in "/proc/irq/$irq/spurious" "/sys/kernel/irq/$irq/type"; do
+        printf '%s: ' "$path"
+        tr '\n' ' ' < "$path" 2>/dev/null || true
+        echo
+      done
+    fi
+    echo '-- ELAN input devices --'
+    awk 'BEGIN{RS=""; ORS="\n\n"} /ELAN0E03/' /proc/bus/input/devices 2>/dev/null || true
+    echo '-- relevant modules --'
+    lsmod | grep -E '^(i2c_hid|hid_multitouch)' || true
+    printf 'i2c_hid file: %s\n' "$(modinfo -n i2c_hid 2>/dev/null || echo unknown)"
+    echo '-- I2C bus devices --'
+    ls -l "/sys/bus/i2c/devices/i2c-$BUS/" 2>/dev/null || true
+    echo "-- $UNIT --"
+    systemctl show "$UNIT" -p ActiveState -p Result -p ExecMainStatus --no-pager 2>&1 || true
+    printf '===== END SNAPSHOT: %s =====\n\n' "$reason"
+  } >> "$LOG_FILE" 2>&1
+}
+
+dump_kernel_context() {
+  {
+    printf '\n===== RELEVANT KERNEL LOG (%s) =====\n' "$(date --iso-8601=ns)"
+    journalctl -b -k --no-pager -o short-monotonic 2>&1 \
+      | grep -Ei 'ELAN0E03|i2c_hid|i2c_designware\.0|00:15\.0|PM: suspend' \
+      | tail -n 200
+    echo '===== END KERNEL LOG ====='
+  } >> "$LOG_FILE" 2>&1
+}
+
+run_logged() {
+  local label=$1 rc rendered
+  shift
+  printf -v rendered '%q ' "$@"
+  log_event "command_start label=[$label] command=[$rendered]"
+  "$@" >> "$LOG_FILE" 2>&1
+  rc=$?
+  log_event "command_end label=[$label] rc=$rc"
+  return "$rc"
+}
+
+on_exit() {
+  local rc=$1 elapsed
+  trap - EXIT
+  trap '' INT TERM HUP
+  [ -n "$WATCH_PID" ] && kill "$WATCH_PID" 2>/dev/null
+  elapsed=$(( $(date +%s) - RUN_START_EPOCH ))
+  case $rc in
+    0)
+      rm -f "$REPORTED"
+      dump_snapshot "success-exit" ;;
+    129|130|143)
+      log_event "interrupted rc=$rc"
+      dump_snapshot "interrupted-exit-$rc" ;;
+    *)
+      FORENSIC=1
+      log_event "recovery_failed rc=$rc; capturing final diagnostics"
+      dump_snapshot "failure-exit-$rc"
+      dump_kernel_context ;;
+  esac
+  log_event "run_end mode=$MODE rc=$rc elapsed_seconds=$elapsed log=$LOG_FILE"
+  # Let tee drain before the shell prompt comes back.
+  exec >&- 2>&-
+  wait "$TEE_PID" 2>/dev/null
+  exit "$rc"
+}
+
+init_logging() {
+  local stamp boot_short script_path script_hash run_tty
+  umask 022
+  LOG_DIR=${TP_TRIAGE_LOG_DIR:-/var/log/tp-triage}
+  if ! mkdir -p "$LOG_DIR" 2>/dev/null; then
+    LOG_DIR=/run/tp-triage
+    mkdir -p "$LOG_DIR" || { echo "Cannot create a tp-triage log directory" >&2; exit 1; }
+  fi
+  chmod 0755 "$LOG_DIR" 2>/dev/null || true
+  # shellcheck disable=SC2012
+  ls -1t "$LOG_DIR"/*.log 2>/dev/null | tail -n +"$KEEP_LOGS" | xargs -r rm -f
+  stamp=$(date '+%Y%m%dT%H%M%S%z')
+  boot_short=$(cut -c1-8 /proc/sys/kernel/random/boot_id 2>/dev/null)
+  # The boot id keeps names unique on boots where the RTC came up reset.
+  LOG_FILE="$LOG_DIR/$MODE-${stamp}-boot${boot_short:-unknown}-pid$$.log"
+  : > "$LOG_FILE" || { echo "Cannot create $LOG_FILE" >&2; exit 1; }
+  ln -sfn "$(basename "$LOG_FILE")" "$LOG_DIR/latest.log" 2>/dev/null || true
+
+  # Preserve the complete transcript. Detailed command output and passive
+  # snapshots are also written directly to the same per-run file. tee ignores
+  # SIGINT so a Ctrl-C still gets its last lines logged.
+  exec > >(trap '' INT; exec tee -a "$LOG_FILE") 2>&1
+  TEE_PID=$!
+  RUN_START_EPOCH=$(date +%s)
+  trap 'on_exit $?' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
+
+  script_path=$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")
+  script_hash=$(sha256sum "$script_path" 2>/dev/null | cut -c1-12)
+  run_tty=$(tty 2>/dev/null) || run_tty=none
+  log_event "run_start mode=$MODE force=$FORCE pid=$$ user=${SUDO_USER:-root} tty=$run_tty kernel=$(uname -r) script=$script_path sha256=${script_hash:-unavailable}"
+}
+
+validate_config() {
+  local name value
+  for name in IDLE_SECONDS ACTIVE_SECONDS MAX_IDLE_INTERRUPTS MIN_ACTIVE_INTERRUPTS SUSPEND_SECONDS; do
+    value=${!name}
+    if ! [[ $value =~ ^[0-9]+$ ]] || [ "$value" -eq 0 ]; then
+      log_event "invalid_configuration variable=$name value=[$value]"
+      return 2
+    fi
+  done
+  if ! [[ $REROLLS =~ ^[0-9]+$ ]]; then
+    log_event "invalid_configuration variable=REROLLS value=[$REROLLS]"
+    return 2
+  fi
+}
+
+# Ask address 0x15 only. 0 = the chip answers (or its driver owns the address),
+# 1 = silent, 2 = cannot tell. Logged only when the answer changes.
+LAST_PROBE=
+chip_responds() {
+  local scan='' cell result rc
+  if bound; then
+    result=driver-owned; rc=0
+  elif ! command -v i2cdetect >/dev/null; then
+    result=no-i2cdetect; rc=2
+  elif [ ! -e "/sys/bus/i2c/devices/i2c-$BUS" ]; then
+    result=no-bus; rc=1
+  else
+    scan=$(i2cdetect -y -r "$BUS" "$ADDR" "$ADDR" 2>&1)
+    cell=$(printf '%s\n' "$scan" | awk '$1 == "10:" { print $2 }')
+    case $cell in
+      15|UU) result=answers; rc=0 ;;
+      --)    result=silent; rc=1 ;;
+      *)     result=unreadable; rc=2 ;;
+    esac
+  fi
+  if [ "$result" != "$LAST_PROBE" ]; then
+    LAST_PROBE=$result
+    [ -n "$scan" ] && printf '\n--- i2cdetect bus %s addr %s at %s ---\n%s\n' \
+      "$BUS" "$ADDR" "$(date --iso-8601=ns)" "$scan" >> "$LOG_FILE"
+    log_event "i2c_probe addr=$ADDR response=$result"
+  fi
+  return "$rc"
+}
+
+# Poll instead of sleeping. When the chip is alive the touchpad is back about
+# 0.15s after its driver or controller appears, and when it is silent waiting
+# never helped, so a fixed wait only delays the verdict either way.
+wait_fixed() { # wait_fixed <seconds>
+  local end=$(( SECONDS + $1 ))
+  until fixed; do
+    [ "$SECONDS" -ge "$end" ] && return 1
+    sleep 0.2
+  done
+}
+
+# Keep the controller out of runtime suspend; the udev rule normally does this
+# at boot, but rebinding the controller driver resets it to auto.
+PIN_CHANGED=0
+pin_controller() {
+  local before after end
+  PIN_CHANGED=0
+  [ -w "$PCI_PATH/power/control" ] || { log_event "pci_power unavailable"; return 1; }
+  before="control=$(pci_attr power/control) runtime=$(pci_attr power/runtime_status) state=$(pci_attr power_state)"
+  echo on > "$PCI_PATH/power/control" 2>> "$LOG_FILE"
+  end=$(( SECONDS + 2 ))
+  until [ "$(pci_attr power/runtime_status)" = active ] || [ "$SECONDS" -ge "$end" ]; do
+    sleep 0.2
+  done
+  after="control=$(pci_attr power/control) runtime=$(pci_attr power/runtime_status) state=$(pci_attr power_state)"
+  if [ "$before" != "$after" ]; then
+    PIN_CHANGED=1
+    log_event "pci_power before=[$before] after=[$after]"
+  fi
+}
+
+# A power change gets a short grace period before the chip is called silent.
+wait_chip() { # wait_chip <seconds>
+  local end=$(( SECONDS + $1 )) rc
+  while :; do
+    chip_responds; rc=$?
+    [ "$rc" -ne 1 ] && return "$rc"
+    [ "$SECONDS" -ge "$end" ] && return 1
+    sleep 0.3
+  done
+}
+
+# Wake a silent chip through I2C address 0x00. A chip that came up wrong
+# ignores 0x15 and holds its interrupt line low until a read addressed to 0x00
+# is ACKed; milliseconds later it answers at 0x15. That read is not ACKed
+# every time: of the first five tried on a dead chip four were, and when the
+# first was NAKed the next one, a second later, went through. So it is
+# retried. Stages, most successful first:
+#   1. read at 0x00, up to 10 times       has revived the chip every time so far
+#   2. read every address (i2cdetect -a)  what was running the first time
+#   3. general-call reset (0x00, 0x06)    NAKed by a dead chip the one time tried
+# Each stage is logged: journalctl -t tp-triage | grep 'wake '
+wake_chip() {
+  local rc try acked=0
+  FORENSIC=1
+  [ -n "$FAULT" ] || FAULT="its chip had not started"
+  dump_snapshot "chip-silent"
+  command -v i2ctransfer >/dev/null || { log_event "wake unavailable reason=no_i2ctransfer"; return 1; }
+  [ -e "/sys/bus/i2c/devices/i2c-$BUS" ] || { log_event "wake unavailable reason=no_bus"; return 1; }
+
+  for try in 1 2 3 4 5 6 7 8 9 10; do
+    i2ctransfer -y -a "$BUS" "r1@0x00" >> "$LOG_FILE" 2>&1; rc=$?
+    [ "$rc" -eq 0 ] && acked=$(( acked + 1 ))
+    if chip_responds; then
+      log_event "wake result=answers stage=read_addr_0x00 tries=$try acked=$acked int=$(int_level)"
+      return 0
+    fi
+    sleep 0.1
+  done
+  log_event "wake stage=read_addr_0x00 tries=10 acked=$acked result=silent int=$(int_level)"
+
+  i2cdetect -y -a -r "$BUS" >> "$LOG_FILE" 2>&1; rc=$?
+  log_event "wake stage=scan_all_addresses rc=$rc int=$(int_level)"
+  wait_chip 2 && { log_event "wake result=answers stage=scan_all_addresses"; return 0; }
+
+  i2ctransfer -y -a "$BUS" "w1@0x00" 0x06 >> "$LOG_FILE" 2>&1; rc=$?
+  log_event "wake stage=general_call_reset rc=$rc int=$(int_level)"
+  wait_chip 1 && { log_event "wake result=answers stage=general_call_reset"; return 0; }
+  log_event "wake result=silent"
+  return 1
+}
+
+# --ignore-install: load it even where a modprobe.d "install" line redirects
+# the load, a common way of keeping a driver from loading by itself.
+load_transport() {
+  modloaded && return 0
+  run_logged "load i2c_hid_acpi" modprobe --ignore-install i2c_hid_acpi
+}
+
+# One explicit bind. The kernel probes the touchpad only when its driver or
+# its I2C client appears, so after a wake nothing else would bind it.
+bind_device() {
+  local rc=0
+  bound && return 0
+  [ -e "$I2CDEV" ] || { log_event "bind_skip reason=no_i2c_client"; return 1; }
+  [ -e "$DRV/bind" ] || { log_event "bind_skip reason=driver_not_registered"; return 1; }
+  printf '%s' "$DEV" > "$DRV/bind" 2>> "$LOG_FILE" || rc=$?
+  log_event "bind_result device=$DEV rc=$rc"
+  return "$rc"
+}
+
+# For an unbound touchpad: pin the controller, load the driver if it is not
+# loaded (the driver core probes the touchpad as the driver registers), wake
+# the chip if it is silent, and bind by hand if nothing bound it yet.
+# A silent chip is never bound blind: that fails with ENXIO at once and
+# retrying it never changed the answer.
+load_and_bind() {
+  pin_controller
+  if ! modloaded; then
+    load_transport
+    if wait_fixed 2; then
+      log_event "load_and_bind result=bound_on_load"
+      return 0
+    fi
+  fi
+  if fixed; then
+    log_event "load_and_bind result=already_bound"
+    return 0
+  fi
+  if [ "$PIN_CHANGED" -eq 1 ]; then wait_chip 2; else chip_responds; fi
+  if [ $? -eq 1 ] && ! wake_chip; then
+    log_event "load_and_bind result=chip_silent"
+    return 1
+  fi
+  if bind_device && wait_fixed 3; then
+    log_event "load_and_bind result=bound"
+    return 0
+  fi
+  log_event "load_and_bind result=failed"
+  return 1
+}
+
+# For a touchpad that is bound but dead (failed resume, interrupt storm): take
+# only the HID driver off the device, note what the chip returns, then wake
+# and bind as above. The bus and its controller are left alone; cycling the
+# controller first lost the chip in two of three such runs.
+rebind_device() {
+  local out rc=0
+  FORENSIC=1
+  dump_snapshot "bound-but-dead"
+  if bound; then
+    printf '%s' "$DEV" > "$DRV/unbind" 2>> "$LOG_FILE" || rc=$?
+    log_event "device_unbind rc=$rc int=$(int_level)"
+  fi
+  if command -v i2ctransfer >/dev/null; then
+    out=$(i2ctransfer -y "$BUS" "r2@$ADDR" 2>&1); rc=$?
+    log_event "raw_read addr=$ADDR rc=$rc data=[${out//$'\n'/ }]"
+  fi
+  LAST_PROBE=
+  load_and_bind
+}
+
+# Step 2, interactive only: cycle the intel-lpss driver on the I2C controller
+# (no PCI remove/rescan). It has fixed an interrupt storm once and
+# re-attached a chip that was alive, 3 of 13 runs overall; it has never
+# revived a silent chip by itself, so the wake is tried again after it.
+# Rebinding resets power/control to auto, hence the pin straight after. Each
+# cycle makes the kernel log a harmless "cannot create duplicate filename
+# .../software_nodes/node1/i2c-0" warning with a stack trace.
+cycle_controller() {
+  local rc=0
+  log_event "controller_cycle start pci=$LPSS"
+  if [ ! -w "$PCI_DRV/unbind" ] || [ ! -w "$PCI_DRV/bind" ]; then
+    log_event "controller_cycle unavailable reason=missing_pci_controls"
+    return 1
+  fi
+  if [ -L "$PCI_PATH/driver" ]; then
+    printf '%s' "$LPSS" > "$PCI_DRV/unbind" 2>> "$LOG_FILE" || rc=$?
+    log_event "controller_cycle pci_unbind rc=$rc"
+    [ "$rc" -eq 0 ] || return "$rc"
+    sleep 2
+  fi
+  printf '%s' "$LPSS" > "$PCI_DRV/bind" 2>> "$LOG_FILE" || rc=$?
+  log_event "controller_cycle pci_bind rc=$rc"
+  [ "$rc" -eq 0 ] || return "$rc"
+  pin_controller
+  load_transport
+
+  # The driver core re-probes the touchpad as the bus comes back.
+  if wait_fixed 3; then
+    log_event "controller_cycle result=bound_with_input"
+    return 0
+  fi
+  LAST_PROBE=
+  chip_responds
+  if { [ $? -ne 1 ] || wake_chip; } && bind_device && wait_fixed 3; then
+    log_event "controller_cycle result=bound_with_input"
+    return 0
+  fi
+  log_event "controller_cycle result=failed"
+  return 1
+}
+
+# Step 3, asked for: power-cycle the chip with a long suspend. Over seven
+# weeks of journal a suspend shorter than about 7 minutes never changed the
+# chip (working stayed working 175 of 175 times, dead stayed dead 143 of 146),
+# while a longer one re-rolled its power-up and 9 of 23 dead chips came back.
+# So: a 10-minute S3 with an RTC alarm, then the wake again. The three times
+# this step itself was run the laptop woke by itself after 257s, 5s and 5s,
+# so nothing was re-rolled; an early wake is reported and not followed by
+# another suspend.
+WOKE_EARLY=0
+suspend_reroll() {
+  local before start slept tries=0
+  command -v rtcwake >/dev/null || { log_event "suspend_reroll unavailable reason=no_rtcwake"; return 1; }
+  # s2idle keeps the rails up; only S3 takes the chip's power away.
+  if ! grep -q '\[deep\]' /sys/power/mem_sleep 2>/dev/null; then
+    echo deep > /sys/power/mem_sleep 2>> "$LOG_FILE" \
+      || { log_event "suspend_reroll unavailable reason=no_deep_sleep"; return 1; }
+  fi
+  before=$(cat /sys/power/suspend_stats/success 2>/dev/null || echo 0)
+  run_logged "arm RTC wake" rtcwake -m no -s "$SUSPEND_SECONDS" || return 1
+  start=$(date +%s)
+  log_event "suspend_reroll start seconds=$SUSPEND_SECONDS"
+  if ! run_logged "suspend" systemctl suspend; then
+    run_logged "disarm RTC wake" rtcwake -m disable
+    return 1
+  fi
+  # systemctl returns before the kernel sleeps. This loop is frozen along with
+  # everything else, so its count is time spent awake.
+  until [ "$(cat /sys/power/suspend_stats/success 2>/dev/null || echo 0)" -gt "$before" ]; do
+    tries=$(( tries + 1 ))
+    if [ "$tries" -gt 60 ]; then
+      log_event "suspend_reroll result=did_not_suspend"
+      run_logged "disarm RTC wake" rtcwake -m disable
+      return 1
+    fi
+    sleep 1
+  done
+  slept=$(( $(date +%s) - start ))
+  run_logged "disarm RTC wake" rtcwake -m disable
+  log_event "suspend_reroll resumed slept_seconds=$slept"
+  WOKE_EARLY=0
+  if [ "$slept" -lt 420 ]; then
+    WOKE_EARLY=1
+    echo "${Y}   woke after ${slept}s; under about 7 minutes the chip is not power-cycled.${N}"
+  fi
+  LAST_PROBE=
+  if bound; then rebind_device; else load_and_bind; fi
+}
+
+pause() { # pause "message" -- wait for Enter on the terminal
+  local a
+  { exec 3<>/dev/tty; } 2>/dev/null || return 1
+  printf '%s' "$Y-> $1 $N" >&3; read -r a <&3; exec 3<&-
+}
+
+# Step 4, asked for: unload and reload both i2c_hid modules. It has not
+# helped in any logged run (0 of 12); its real use is picking up a rebuilt
+# i2c_hid.
+reload_transport() {
+  run_logged "unload i2c_hid_acpi" modprobe -r i2c_hid_acpi
+  run_logged "unload i2c_hid" modprobe -r i2c_hid
+  LAST_PROBE=
+  load_and_bind
+}
+
+# Step 5, asked for: take the controller off the PCI bus and rescan. It has
+# not produced a working touchpad in 12 logged tries; twice the chip bound
+# 10-15s after the rescan and was dead on the finger test, so the wake is
+# repeated for a while instead of binding once.
+rescan_controller() {
+  local rc=0 end
+  if [ -e "$PCI_PATH/remove" ]; then
+    echo 1 > "$PCI_PATH/remove" 2>> "$LOG_FILE" || rc=$?
+    log_event "pci_remove rc=$rc"
+    sleep 3
+  fi
+  rc=0
+  echo 1 > /sys/bus/pci/rescan 2>> "$LOG_FILE" || rc=$?
+  log_event "pci_rescan rc=$rc"
+  echo "   trying for up to 20s (Ctrl-C to stop)"
+  end=$(( SECONDS + 20 ))
+  while [ "$SECONDS" -lt "$end" ]; do
+    LAST_PROBE=
+    [ -e "$I2CDEV" ] && load_and_bind && return 0
+    sleep 1
+  done
+  fixed
+}
+
+# A failed resume leaves the driver bound to a dead chip, which looks healthy
+# in sysfs. The kernel names it just before "PM: suspend exit".
+# Coming back from hibernation the same failure is logged as "failed to
+# restore" (or "thaw") between the hibernation entry and exit lines.
+resume_failed() {
+  journalctl -k -b --no-pager -o cat 2>/dev/null | awk '
+    /PM: suspend entry|PM: hibernation: hibernation entry/ { f=0 }
+    /i2c-ELAN0E03:00: PM: failed to (resume|restore|thaw)/ { f=1 }
+    /PM: suspend exit|PM: hibernation: hibernation exit/ { bad=f }
+    /input: ELAN0E03:00 04F3:3191 Touchpad/ { bad=0 }
+    END { exit !bad }'
+}
+
+# The same condition seen from the interrupt counter, for when the kernel log
+# is not readable yet: a storm runs at thousands a second.
+storming() {
+  local a b
+  a=$(irq_total) || return 1
+  sleep 0.3
+  b=$(irq_total) || return 1
+  [ $(( b - a )) -gt 300 ]
+}
+
+# True when there is something to do. FAULT says what was wrong when the
+# touchpad is really faulty; being merely unbound is not a fault by itself
+# (the driver may just not be loaded), and wake_chip sets it if the chip turns
+# out silent.
+FAULT=
+needs_recovery() {
+  if resume_failed; then FAULT="it did not come back after resume"; return 0; fi
+  if storming; then FAULT="it was flooding the system with interrupts"; return 0; fi
+  fixed && return 1
+  # The kernel probes the touchpad by itself as its driver or its I2C client
+  # appears, and udev starts the unit at that same moment. Let that probe
+  # finish before calling an unbound touchpad a problem.
+  modloaded && wait_fixed 2 && return 1
+  return 0
+}
+
+# The lid switch's input device node.
+lid_event_node() {
+  awk 'BEGIN { RS = "" }
+       /Name="Lid Switch"/ && match($0, /event[0-9]+/) { print "/dev/input/" substr($0, RSTART, RLENGTH); exit }
+      ' /proc/bus/input/devices
+}
+
+# --watch-lid: start the unit each time the lid is opened. Twice the chip was
+# found dead seconds after the lid was opened on a laptop that had stayed
+# awake with it closed, which is neither a boot nor a resume, and nothing in
+# udev or systemd fires on the lid. So this reads the switch itself and sleeps
+# in between. An input event is 24 bytes on x86-64, two 8-byte time fields
+# followed by type, code and value, and od prints it as twelve 16-bit words:
+# the 9th is the type (5 = switch), the 10th the code (0 = lid) and the 11th
+# the value (0 = open). The unit is started twice because it is not known how
+# long after the lid the chip goes; a healthy check costs half a second.
+watch_lid() {
+  local node type code value
+  [[ $LID_RECHECK_SECONDS =~ ^[0-9]+$ ]] || LID_RECHECK_SECONDS=10
+  node=$(lid_event_node)
+  if [ -z "$node" ] || [ ! -r "$node" ]; then
+    echo "No readable lid switch input device." >&2
+    return 1
+  fi
+  echo "Watching $node; opening the lid starts $UNIT."
+  stdbuf -oL od -An -v -tu2 -w24 "$node" | while read -r _ _ _ _ _ _ _ _ type code value _; do
+    [ "$type" = 5 ] && [ "$code" = 0 ] && [ "$value" = 0 ] || continue
+    sleep 1
+    systemctl start "$UNIT"
+    sleep "$LID_RECHECK_SECONDS"
+    systemctl start "$UNIT"
+  done
+  echo "The lid switch reader ended." >&2
+  return 1
+}
+
+state() {
+  local f rc; f=$(acpi_node); chip_responds; rc=$?
+  echo "${B}--- state ---${N}"
+  echo -n "  i2c client : "; [ -e "$I2CDEV" ] && echo "present" || echo "${R}MISSING${N}"
+  echo -n "  driver     : "; bound && echo "${G}bound${N}" || echo "${R}NONE${N}"
+  echo -n "  input node : "; haveinput && echo "${G}yes${N}" || echo "${R}no${N}"
+  echo -n "  _STA       : "; cat "$f/status" 2>/dev/null || echo unavailable
+  echo -n "  module     : "; modloaded && echo "loaded" || echo "${R}not loaded${N}"
+  echo -n "  chip @$ADDR : "
+  case $rc in
+    0) bound && echo "owned by the driver (not probed)" || echo "${G}answers${N}";;
+    1) echo "${R}SILENT${N}";;
+    *) echo "unknown (needs root and i2c-tools)";;
+  esac
+  echo -n "  INT line   : "
+  case "$(int_level):$rc" in
+    low:1) echo "${R}low -- chip has not started; it needs the address-0 wake${N}";;
+    low:*) echo "low";;
+    high:*) echo "high";;
+    *) echo "unknown (needs root)";;
+  esac
+  echo    "  controller : control=$(pci_attr power/control) runtime=$(pci_attr power/runtime_status) state=$(pci_attr power_state)"
+  echo    "  unit       : $UNIT $(systemctl is-enabled "$UNIT" 2>/dev/null || echo missing), last result $(systemctl show -p Result --value "$UNIT" 2>/dev/null)"
+  echo    "  lid watcher: $WATCH_UNIT $(systemctl is-active "$WATCH_UNIT" 2>/dev/null)"
+  if bound; then
+    echo -n "  last resume: "
+    resume_failed && echo "${R}FAILED (-121): the driver is bound to a dead chip${N}" || echo "no touchpad error"
+  fi
+}
+
+# 0 = working, 1 = too little activity (or no IRQ line), 2 = interrupt storm.
+confirm_live() {
+  echo -n "Keep fingers off the touchpad for ${IDLE_SECONDS}s... "
+  if ! watch_activity idle "$IDLE_SECONDS" 0; then
+    echo "${R}ELAN IRQ missing.${N}"; log_event "activity_result=missing_irq"; return 1
+  fi
+  echo "$WATCH_DELTA idle interrupts."
+  if [ "$WATCH_DELTA" -gt "$MAX_IDLE_INTERRUPTS" ]; then
+    echo "${R}${WATCH_DELTA} idle interrupts -- interrupt storm; the chip is not running.${N}"
+    log_event "activity_result=interrupt_storm interrupts=$WATCH_DELTA"
+    dump_snapshot "interrupt-storm"
+    return 2
+  fi
+
+  echo -n "Move a finger on the touchpad (up to ${ACTIVE_SECONDS}s)... "
+  if ! watch_activity active "$ACTIVE_SECONDS" "$MIN_ACTIVE_INTERRUPTS"; then
+    echo "${R}ELAN IRQ disappeared.${N}"; log_event "activity_result=irq_disappeared"; return 1
+  fi
+  if [ "$WATCH_DELTA" -lt "$MIN_ACTIVE_INTERRUPTS" ]; then
+    echo "${R}${WATCH_DELTA} interrupts -- bound but not reporting meaningful activity.${N}"
+    log_event "activity_result=too_low interrupts=$WATCH_DELTA finger_events=$FINGER_EVENTS"
+    return 1
+  fi
+  echo "${G}${WATCH_DELTA} interrupts, ${FINGER_EVENTS} libinput finger events -- working.${N}"
+  log_event "activity_result=working interrupts=$WATCH_DELTA finger_events=$FINGER_EVENTS"
+  return 0
+}
+
+step() { # step "label" <function>
+  local label=$1 rc
+  echo "${B}>> $label${N}"; shift
+  log_event "step_start label=[$label]"
+  "$@"; rc=$?
+  log_event "step_end label=[$label] rc=$rc"
+  if [ "$rc" -eq 0 ]; then
+    echo "${G}   Device is bound with an input node; validating activity.${N}"
+    return 0
+  fi
+  dump_snapshot "after-step-$label-failed"
+  echo "   still dead"; return 1
+}
+
+if [ "$MODE" = status ]; then
+  state
+  exit 0
+fi
+
+if [ "$MODE" = notify ]; then
+  notify_user normal "Touchpad notification test" \
+    "This is where tp-triage reports a touchpad it found dead after resume or boot, once per recovery."
+  exit
+fi
+
+[ "$(id -u)" -eq 0 ] || { echo "Needs root -- re-running under sudo..."; exec sudo -- "$0" "$@"; }
+
+if [ "$(cat /sys/class/dmi/id/product_name 2>/dev/null)" != "$MODEL" ]; then
+  echo "tp-triage is only for the LG $MODEL; refusing to touch PCI $LPSS here." >&2
+  exit 65
+fi
+
+if [ "$MODE" = watch ]; then
+  watch_lid
+  exit
+fi
+
+# The unit runs this at every boot, resume and opening of the lid; a healthy
+# touchpad costs half a second and leaves no log. Before the I2C client exists
+# there is nothing to do either: udev starts the unit again when it appears.
+if [ "$MODE" = auto ] && [ "$FORCE" -eq 0 ]; then
+  [ -e "$I2CDEV" ] || exit 0
+  needs_recovery || { rm -f "$REPORTED"; exit 0; }
+fi
+
+exec 9> /run/lock/tp-triage.lock
+if ! flock -n 9; then
+  [ "$MODE" = auto ] && exit 0
+  echo "Another tp-triage run is in progress." >&2
+  exit 75
+fi
+
+init_logging
+validate_config || exit $?
+dump_snapshot "run-start"
+
+# An interrupted controller re-enumeration leaves it off the PCI bus.
+if [ ! -d "$PCI_PATH" ]; then
+  log_event "controller_missing action=pci_rescan"
+  echo 1 > /sys/bus/pci/rescan 2>> "$LOG_FILE"
+  sleep 1
+fi
+
+if [ "$MODE" = auto ]; then
+  if bound; then rebind_device; else load_and_bind; fi
+  notify_fault
+  # Nobody is watching this run, and every wake that has worked so far came
+  # 28 seconds or more after the resume; the chip may not be ready for it
+  # straight away. So a failed wake is tried again twice, 5 seconds apart.
+  round=1
+  while ! fixed && [ "$round" -lt 3 ]; do
+    round=$(( round + 1 ))
+    sleep 5
+    log_event "auto_retry round=$round"
+    LAST_PROBE=
+    load_and_bind
+  done
+  attempt=0
+  while ! fixed && [ "$attempt" -lt "$REROLLS" ]; do
+    attempt=$(( attempt + 1 ))
+    echo "Suspending for ${SUSPEND_SECONDS}s to power-cycle the chip (attempt $attempt of $REROLLS)."
+    suspend_reroll
+    if [ "$WOKE_EARLY" -eq 1 ] && ! fixed; then
+      echo "Woken early; not suspending again automatically."
+      break
+    fi
+  done
+  if fixed && ! storming; then
+    echo "Touchpad bound."
+    exit 0
+  fi
+  echo "Touchpad not recovered; run tp-triage from a terminal."
+  exit 1
+fi
+
+echo "${B}=== ELAN touchpad triage ===${N}"
+echo "Log: $LOG_FILE"
+state; echo
+
+self=$(readlink -f "$0")
+if ! cmp -s "$self" "$INSTALLED"; then
+  echo "${Y}NOTE: the unit runs $INSTALLED, which differs from this copy.${N}"
+  [ -f "${self%/bin/*}/install.sh" ] && echo "      bash ${self%/bin/*}/install.sh"
+  echo
+fi
+
+if [ "$FORCE" -eq 0 ] && fixed; then
+  if resume_failed; then
+    echo "${Y}The last resume failed for the touchpad; recovering.${N}"
+  else
+    echo "${G}Touchpad is bound; checking for real event activity.${N}"
+    confirm_live; live=$?
+    [ "$live" -eq 0 ] && exit 0
+    # Too little activity may only mean no finger was on the pad, and recovery
+    # drops a touchpad that might be fine. A storm needs no second opinion.
+    if [ "$live" -eq 1 ]; then
+      ask "No finger activity seen. Run recovery anyway (drops the touchpad briefly)?" || exit 1
+    fi
+  fi
+fi
+
+# --- Recovery ------------------------------------------------------------
+echo "${B}Attempting recovery.${N}"
+echo
+
+if bound; then
+  if step "Rebind the HID driver and wake the chip" rebind_device && confirm_live; then
+    exit 0
+  fi
+else
+  if step "Load the driver, wake the chip and bind" load_and_bind && confirm_live; then
+    exit 0
+  fi
+fi
+
+if step "Cycle the I2C controller driver" cycle_controller && confirm_live; then
+  exit 0
+fi
+
+echo
+echo "${Y}Still not working. The remaining steps are asked for one by one, most${N}"
+echo "${Y}successful first.${N}"
+attempt=0
+while ask "Suspend for $(( SUSPEND_SECONDS / 60 )) minutes to power-cycle the chip? It wakes by itself; do not wake it early."; do
+  attempt=$(( attempt + 1 ))
+  if step "Suspend re-roll, attempt $attempt" suspend_reroll; then
+    pause "Touchpad is bound again. Press Enter when you are ready for the finger test."
+    confirm_live && exit 0
+  fi
+done
+
+if ask "Reload the i2c_hid modules? (has not helped in any logged run)"; then
+  if step "Module reload" reload_transport && confirm_live; then
+    exit 0
+  fi
+fi
+
+echo
+echo "${Y}The last step re-enumerates the LPSS I2C controller (PCI $LPSS).${N}"
+echo "${Y}The I2C bus disappears for a few seconds. Only the touchpad is on it.${N}"
+if ask "Re-enumerate the I2C controller? (has not helped in any logged run)"; then
+  if step "PCI remove + rescan" rescan_controller && confirm_live; then
+    exit 0
+  fi
+fi
+
+echo
+echo "${R}${B}Not recovered.${N}"; state; echo
+echo "Nothing in the ladder brought the chip back this time. What is left is a"
+echo "power-cycle of the chip: a suspend longer than about 7 minutes, or a"
+echo "power-off and cold boot. Either comes up working a bit under half the"
+echo "time, and this script (or the unit, after a resume) binds it when it does."
+echo "Short suspends, warm reboots and draining the EC do not change anything."
+exit 1

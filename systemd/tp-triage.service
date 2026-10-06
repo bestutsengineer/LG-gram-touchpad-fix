@@ -1,0 +1,16 @@
+# Started at boot, by udev whenever the touchpad's I2C client appears (boot,
+# or the controller being re-enumerated), by the sleep targets after every
+# resume, and by tp-triage-lid-watch.service when the lid is opened.
+# tp-triage --auto exits at once when the touchpad is healthy.
+# It must not use RemainAfterExit: a unit that stays active is not started
+# again after resume.
+[Unit]
+Description=Check and wake the LG Gram ELAN touchpad (boot, resume, lid open)
+After=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/tp-triage --auto
+
+[Install]
+WantedBy=multi-user.target suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target

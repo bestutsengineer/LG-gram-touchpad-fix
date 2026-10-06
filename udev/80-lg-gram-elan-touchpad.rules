@@ -1,0 +1,12 @@
+# LG Gram 16Z90P ELAN touchpad: ELAN0E03 behind the Intel LPSS I2C controller
+# 8086:a0e8 (subsystem 1854:0400). Part of tp-triage; see its README.md.
+
+# Keep that controller out of runtime suspend.
+ACTION=="add|change", SUBSYSTEM=="pci", ATTR{vendor}=="0x8086", ATTR{device}=="0xa0e8", ATTR{subsystem_vendor}=="0x1854", ATTR{subsystem_device}=="0x0400", ATTR{power/control}="on"
+
+# When the touchpad's I2C client appears, have systemd check it. The kernel
+# binds the driver by itself when the chip answers; the unit wakes the chip
+# when it came up silent.
+# "add" only: matching bind/unbind events as well makes systemd start the unit
+# again every time a driver is attached or detached, including by tp-triage.
+ACTION=="add", SUBSYSTEM=="i2c", KERNEL=="i2c-ELAN0E03:00", TAG+="systemd", ENV{SYSTEMD_WANTS}+="tp-triage.service"
