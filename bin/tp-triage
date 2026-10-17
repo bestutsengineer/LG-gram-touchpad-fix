@@ -49,6 +49,10 @@ MIN_ACTIVE_INTERRUPTS=${TP_TRIAGE_MIN_ACTIVE_INTERRUPTS:-20}
 # Length of the power-cycling suspend; see suspend_reroll for why 10 minutes.
 SUSPEND_SECONDS=${TP_TRIAGE_SUSPEND_SECONDS:-600}
 
+# How long an unattended run keeps repeating a wake that has not worked yet.
+# The slowest chip so far took 60 seconds; this leaves three times that.
+AUTO_RETRY_SECONDS=${TP_TRIAGE_AUTO_RETRY_SECONDS:-180}
+
 # After the lid opens the touchpad is checked at once and again this much later.
 LID_RECHECK_SECONDS=${TP_TRIAGE_LID_RECHECK_SECONDS:-10}
 
@@ -72,8 +76,10 @@ Usage: tp-triage [--status | --auto | --watch-lid] [--force] [--suspend[=N]]
 
 An --auto run that finds the touchpad faulty (failed resume, interrupt storm,
 silent chip) sends one desktop notification saying whether its first recovery
-attempt worked. A healthy touchpad, or one that only needed its driver bound,
-sends none, and a failure that was already reported is not reported twice.
+attempt worked, and keeps trying for 3 minutes. If a later attempt gets the
+touchpad back, "not responding" is replaced by "recovered". A healthy
+touchpad, or one that only needed its driver bound, sends none, and a failure
+that was already reported is not reported twice.
 
 The interactive ladder, most successful step first:
   1. wake the chip through I2C address 0x00, then bind      (automatic)
@@ -154,12 +160,19 @@ log_event() {
 # One desktop notification to whoever is logged in at the screen. The unit
 # runs as root, so it goes through that user's session bus; before anyone has
 # logged in there is nobody to tell.
+# With NOTIFY_REPLACE set to a notification's id the new one takes its place
+# on screen; the id of the one just sent is left in NOTIFY_ID.
+NOTIFY_REPLACE=
+NOTIFY_ID=
 notify_user() { # notify_user <urgency> <title> <body>
-  local urgency=$1 title=$2 body=$3 sid uid user rc
-  local -a cmd=(notify-send --app-name=Touchpad --icon=input-touchpad "--urgency=$urgency" --expire-time=15000 "$title" "$body")
+  local urgency=$1 title=$2 body=$3 sid uid user rc out
+  local -a cmd=(notify-send --app-name=Touchpad --icon=input-touchpad "--urgency=$urgency" --expire-time=15000 --print-id)
+  [[ $NOTIFY_REPLACE =~ ^[0-9]+$ ]] && cmd+=("--replace-id=$NOTIFY_REPLACE")
+  cmd+=("$title" "$body")
+  NOTIFY_ID=
   command -v notify-send >/dev/null || { log_event "notify skipped reason=no_notify-send"; return 0; }
   if [ "$(id -u)" -ne 0 ]; then
-    "${cmd[@]}"
+    "${cmd[@]}" > /dev/null
     return
   fi
   for sid in $(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $1}'); do
@@ -169,8 +182,9 @@ notify_user() { # notify_user <urgency> <title> <body>
     uid=$(loginctl show-session "$sid" -p User --value 2>/dev/null)
     user=$(loginctl show-session "$sid" -p Name --value 2>/dev/null)
     [ -S "/run/user/$uid/bus" ] || continue
-    runuser -u "$user" -- env "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus" "${cmd[@]}" >> "$LOG_FILE" 2>&1
+    out=$(runuser -u "$user" -- env "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus" "${cmd[@]}" 2>> "$LOG_FILE")
     rc=$?
+    [[ $out =~ ^[0-9]+$ ]] && NOTIFY_ID=$out
     log_event "notify user=$user urgency=$urgency title=[$title] rc=$rc"
     return 0
   done
@@ -182,19 +196,26 @@ notify_user() { # notify_user <urgency> <title> <body>
 # faulty: binding a driver that was merely not bound is not worth a popup.
 # Several triggers can run this for one fault (a resume and the lid, say), so
 # a failure that has been reported is not reported again until the touchpad
-# has been seen working.
+# has been seen working. The report marker holds the id of the "not
+# responding" popup, so that "recovered" can take its place when a later
+# attempt, or a later run, gets the touchpad back.
 notify_fault() {
-  [ -n "$FAULT" ] || return 0
+  if [ -z "$FAULT" ]; then
+    [ -e "$REPORTED" ] && fixed || return 0
+    FAULT="it had stopped answering"
+  fi
   if fixed; then
+    NOTIFY_REPLACE=$(cat "$REPORTED" 2>/dev/null)
     rm -f "$REPORTED"
     notify_user normal "Touchpad recovered" \
       "The touchpad was dead: $FAULT. tp-triage woke the chip and rebound the driver."
+    NOTIFY_REPLACE=
   elif [ -e "$REPORTED" ]; then
     log_event "notify skipped reason=already_reported"
   else
-    : > "$REPORTED"
     notify_user critical "Touchpad not responding" \
-      "The touchpad is dead: $FAULT. tp-triage is still trying; if the pointer stays dead, run tp-triage in a terminal."
+      "The touchpad is dead: $FAULT. tp-triage keeps trying for up to $(retry_span); if the pointer is still dead after that, run tp-triage in a terminal."
+    printf '%s\n' "$NOTIFY_ID" > "$REPORTED"
   fi
 }
 
@@ -405,7 +426,7 @@ init_logging() {
 
 validate_config() {
   local name value
-  for name in IDLE_SECONDS ACTIVE_SECONDS MAX_IDLE_INTERRUPTS MIN_ACTIVE_INTERRUPTS SUSPEND_SECONDS; do
+  for name in IDLE_SECONDS ACTIVE_SECONDS MAX_IDLE_INTERRUPTS MIN_ACTIVE_INTERRUPTS SUSPEND_SECONDS AUTO_RETRY_SECONDS; do
     value=${!name}
     if ! [[ $value =~ ^[0-9]+$ ]] || [ "$value" -eq 0 ]; then
       log_event "invalid_configuration variable=$name value=[$value]"
@@ -597,6 +618,53 @@ rebind_device() {
   fi
   LAST_PROBE=
   load_and_bind
+}
+
+retry_span() { # AUTO_RETRY_SECONDS in words, for messages
+  [[ $AUTO_RETRY_SECONDS =~ ^[0-9]+$ ]] || { echo "a few minutes"; return; }
+  if [ "$AUTO_RETRY_SECONDS" -ge 120 ]; then echo "$(( AUTO_RETRY_SECONDS / 60 )) minutes"
+  else echo "$AUTO_RETRY_SECONDS seconds"; fi
+}
+
+# Unattended only, after a first attempt that left the chip silent. Straight
+# after a resume the chip has three times ignored every wake for 20 to 60
+# seconds, then answered the next attempt within milliseconds. Repeating the
+# whole first attempt every 10 seconds left 6 seconds at a time with nothing
+# sent; this spreads the same three wakes out evenly instead: a read at 0x00
+# every half second, a general-call reset every 2.5 seconds and a scan every
+# 10. That is no more bus traffic than the first attempt makes, and a few
+# milliseconds of CPU per try. Reading the pad state takes 0.2 seconds, so it
+# is logged only every 10 seconds, and no snapshots are taken.
+# Counted in tries, not seconds: sleep stops while the laptop is suspended, so
+# a run caught by a suspend carries on after it (the unit cannot be started
+# again while this run is still going).
+retry_wake() {
+  local tries=$(( AUTO_RETRY_SECONDS * 2 )) try=0 stage reads=0 acked=0 resets=0 start=$SECONDS
+  command -v i2ctransfer >/dev/null || return 1
+  [ -e "/sys/bus/i2c/devices/i2c-$BUS" ] || return 1
+  while [ "$try" -lt "$tries" ]; do
+    try=$(( try + 1 ))
+    sleep 0.5
+    fixed && return 0
+    if (( try % 20 == 0 )); then
+      stage=scan_all_addresses
+      i2cdetect -y -a -r "$BUS" >> "$LOG_FILE" 2>&1
+    elif (( try % 5 == 0 )); then
+      stage=general_call_reset; resets=$(( resets + 1 ))
+      i2ctransfer -y -a "$BUS" "w1@0x00" 0x06 >> "$LOG_FILE" 2>&1
+    else
+      stage=read_addr_0x00; reads=$(( reads + 1 ))
+      i2ctransfer -y -a "$BUS" "r1@0x00" >> "$LOG_FILE" 2>&1 && acked=$(( acked + 1 ))
+    fi
+    if chip_responds; then
+      log_event "wake result=answers stage=$stage retry=$try seconds=$(( SECONDS - start )) int=$(int_level)"
+      load_and_bind && return 0
+    elif (( try % 20 == 0 )); then
+      log_event "auto_retry tries=$try seconds=$(( SECONDS - start )) reads=$reads acked=$acked resets=$resets int=$(int_level)"
+    fi
+  done
+  log_event "auto_retry gave_up tries=$try seconds=$(( SECONDS - start ))"
+  return 1
 }
 
 # Step 2, interactive only: cycle the intel-lpss driver on the I2C controller
@@ -909,7 +977,7 @@ fi
 exec 9> /run/lock/tp-triage.lock
 if ! flock -n 9; then
   [ "$MODE" = auto ] && exit 0
-  echo "Another tp-triage run is in progress." >&2
+  echo "Another tp-triage run is in progress. After a failure the service keeps trying for up to $(retry_span); try again when it has finished." >&2
   exit 75
 fi
 
@@ -927,17 +995,11 @@ fi
 if [ "$MODE" = auto ]; then
   if bound; then rebind_device; else load_and_bind; fi
   notify_fault
-  # Nobody is watching this run, and every wake that has worked so far came
-  # 28 seconds or more after the resume; the chip may not be ready for it
-  # straight away. So a failed wake is tried again twice, 5 seconds apart.
-  round=1
-  while ! fixed && [ "$round" -lt 3 ]; do
-    round=$(( round + 1 ))
-    sleep 5
-    log_event "auto_retry round=$round"
-    LAST_PROBE=
-    load_and_bind
-  done
+  # Nobody is watching this run, and straight after a resume the chip may not
+  # be ready for the wake for up to a minute: keep trying (see retry_wake).
+  fixed || retry_wake
+  # A later try got it back after "not responding" went out: say so.
+  [ -e "$REPORTED" ] && fixed && notify_fault
   attempt=0
   while ! fixed && [ "$attempt" -lt "$REROLLS" ]; do
     attempt=$(( attempt + 1 ))

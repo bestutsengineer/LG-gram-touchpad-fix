@@ -66,13 +66,17 @@ esac'
   stub rtcwake 'exit 0'
   stub loginctl 'case "$1" in list-sessions) echo "2 1000 tester seat0 100 user tty2 no -" ;;
   show-session) case "$*" in *Active*) echo yes;; *Class*) echo user;; *Type*) echo wayland;; *User*) echo 1000;; *Name*) echo tester;; esac ;; esac'
-  stub runuser 'echo "$*" >> "$F/notifications"'
+  stub runuser 'echo "$*" >> "$F/notifications"; case " $* " in *" --print-id "*) echo 42;; esac'
   stub notify-send 'echo "direct $*" >> "$F/notifications"'
   mkdir -p "$F/run/user/1000"; python3 -c "import socket,sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])" "$F/run/user/1000/bus"; : > "$F/notifications"
-  stub i2cdetect 'case " $* " in *" -a "*) [ -e "$F/wake_on_scan" ] && touch "$F/chip_alive" ;; esac
+  stub i2cdetect 'case " $* " in *" -a "*) echo "$*" >> "$F/scan.log"
+    if [ -e "$F/wake_on_scan" ]; then need=$(cat "$F/wake_on_scan"); [ "$(wc -l < "$F/scan.log")" -ge "${need:-1}" ] && touch "$F/chip_alive"; fi ;; esac
 echo "     0  1  2  3  4  5"; if [ -e "$F/chip_alive" ]; then echo "10:                15"; else echo "10:                --"; fi'
   stub i2ctransfer 'case "$*" in *r1@0x00*) echo "$*" >> "$F/addr0.log"
     if [ -e "$F/wake_on_addr0" ]; then need=$(cat "$F/wake_on_addr0"); [ "$(wc -l < "$F/addr0.log")" -ge "${need:-1}" ] && { touch "$F/chip_alive"; exit 0; }; fi
+    exit 1 ;;
+  *w1@0x00\ 0x06*) echo "$*" >> "$F/gc.log"
+    if [ -e "$F/wake_on_gc" ]; then [ "$(wc -l < "$F/gc.log")" -ge "$(cat "$F/wake_on_gc")" ] && { touch "$F/chip_alive"; exit 0; }; fi
     exit 1 ;;
   *@0x00*) exit 1 ;; esac
 if [ -e "$F/chip_alive" ]; then echo "0x00 0x00"; else echo "Error: Sending messages failed: Remote I/O error" >&2; exit 1; fi'
@@ -107,7 +111,7 @@ loaded()   { mkdir -p "$F/sys/module/i2c_hid_acpi"; }
 alive()    { touch "$F/chip_alive"; }
 healthy()  { loaded; alive; attach; }
 dead_but_bound() { healthy; rm "$F/chip_alive"; }       # what a failed resume leaves behind
-reported() { : > "$F/run/lock/tp-triage.reported"; }      # an earlier run already sent "not responding"
+reported() { echo 17 > "$F/run/lock/tp-triage.reported"; }   # an earlier run already sent "not responding", as popup 17
 resume_error() { printf '%s\n' 'PM: suspend entry (deep)' 'i2c_hid_acpi i2c-ELAN0E03:00: PM: failed to resume async: error -121' 'PM: suspend exit' > "$F/kmsg"; }
 # Interrupt counter: 60/s under a live chip (a finger), 4000/s under a bound dead one (a storm).
 ticker() { ( while true; do
@@ -121,7 +125,7 @@ ticker() { ( while true; do
 run() { # run <stdin-text> [script args...]; sets RC, ELAPSED
   local input=$1; shift
   local start; start=$(date +%s.%N)
-  printf '%s' "$input" | PATH="$F/bin:$PATH" TP_TRIAGE_LOG_DIR="$F/logs" JOURNAL_STREAM='' \
+  printf '%s' "$input" | PATH="$F/bin:$PATH" TP_TRIAGE_LOG_DIR="$F/logs" TP_TRIAGE_AUTO_RETRY_SECONDS=12 JOURNAL_STREAM='' \
     "$F/tp-triage" "$@" > "$F/out" 2>&1
   RC=$?
   ELAPSED=$(echo "$(date +%s.%N) - $start" | bc)
@@ -144,7 +148,7 @@ check() { # check <name> <expected rc> <max seconds> [regex that must appear in 
 notes() { # notes <expected count> [regex the notification must match]
   local n; n=$(wc -l < "$F/notifications")
   if [ "$n" -ne "$1" ]; then echo "      FAIL: $n notifications, expected $1"; fail=$((fail+1))
-  elif [ -n "${2:-}" ] && ! grep -qE "$2" "$F/notifications"; then echo "      FAIL: notification text: $(cat "$F/notifications")"; fail=$((fail+1)); fi
+  elif [ -n "${2:-}" ] && ! grep -qE -- "$2" "$F/notifications"; then echo "      FAIL: notification text: $(cat "$F/notifications")"; fail=$((fail+1)); fi
 }
 scenario() { [ -z "$ONLY" ] || [ "$ONLY" = "$1" ]; }
 ONLY=${TP_TEST_ONLY:-}
@@ -173,22 +177,31 @@ if scenario auto-wake-second-try; then setup auto-wake-second-try; loaded; echo 
 if scenario auto-wake-by-scan; then setup auto-wake-by-scan; loaded; touch "$F/wake_on_scan"
   run '' --auto; check auto-wake-by-scan 0 7.5 'read_addr_0x00 tries=10 acked=0 result=silent' 'wake result=answers stage=scan_all_addresses'; fi
 if scenario auto-wake-late; then setup auto-wake-late; loaded; echo 14 > "$F/wake_on_addr0"
-  run '' --auto; check auto-wake-late 0 22.5 'auto_retry round=2' 'wake result=answers stage=read_addr_0x00' 'load_and_bind result=bound'; notes 1 'urgency=critical.*Touchpad not responding'; fi
+  run '' --auto; check auto-wake-late 0 12 'wake result=answers stage=read_addr_0x00 retry=4 ' 'load_and_bind result=bound'
+  notes 2 'urgency=critical.*Touchpad not responding'
+  grep -qE 'urgency=normal.*--replace-id=42 Touchpad recovered' "$F/notifications" || { echo "      FAIL: no \"recovered\" in place of popup 42: $(tail -1 "$F/notifications")"; fail=$((fail+1)); }
+  [ ! -e "$F/run/lock/tp-triage.reported" ] || { echo "      FAIL: late recovery left the report marker"; fail=$((fail+1)); }; fi
 if scenario auto-boot-dead; then setup auto-boot-dead
-  run '' --auto; check auto-boot-dead 1 30 'auto_retry round=3' 'wake stage=general_call_reset' 'wake stage=scan_all_addresses' 'wake result=silent' '!controller_cycle'; notes 1 'Touchpad not responding'
-  [ -e "$F/run/lock/tp-triage.reported" ] || { echo "      FAIL: a reported failure left no marker"; fail=$((fail+1)); }; fi
+  run '' --auto; check auto-boot-dead 1 30 'auto_retry tries=20 ' 'auto_retry gave_up tries=24' 'wake stage=general_call_reset' 'wake stage=scan_all_addresses' 'wake result=silent' '!controller_cycle'; notes 1 'Touchpad not responding'
+  [ "$(cat "$F/run/lock/tp-triage.reported" 2>/dev/null)" = 42 ] || { echo "      FAIL: a reported failure did not leave its popup id in the marker"; fail=$((fail+1)); }; fi
+# The later tries keep all three wakes: the reset every fifth try, the scan every twentieth.
+if scenario auto-wake-late-reset; then setup auto-wake-late-reset; loaded; echo 2 > "$F/wake_on_gc"
+  run '' --auto; check auto-wake-late-reset 0 12 'wake stage=general_call_reset rc=1' 'wake result=answers stage=general_call_reset retry=5 ' 'load_and_bind result=bound'
+  notes 2 'replace-id=42 Touchpad recovered'; fi
+if scenario auto-wake-late-scan; then setup auto-wake-late-scan; loaded; echo 2 > "$F/wake_on_scan"
+  run '' --auto; check auto-wake-late-scan 0 20 'wake result=answers stage=scan_all_addresses retry=20 ' 'load_and_bind result=bound'; notes 2; fi
 # A second trigger for the same fault (resume, then the lid) must not notify again.
 if scenario auto-dead-already-reported; then setup auto-dead-already-reported; loaded; reported
   run '' --auto; check auto-dead-already-reported 1 32.5 'notify skipped reason=already_reported' 'wake result=silent'; notes 0; fi
 if scenario auto-recovered-after-report; then setup auto-recovered-after-report; loaded; reported; touch "$F/wake_on_addr0"
-  run '' --auto; check auto-recovered-after-report 0 5.5 'wake result=answers'; notes 1 'Touchpad recovered'
+  run '' --auto; check auto-recovered-after-report 0 5.5 'wake result=answers'; notes 1 '--replace-id=17 Touchpad recovered'
   [ ! -e "$F/run/lock/tp-triage.reported" ] || { echo "      FAIL: recovery left the report marker"; fail=$((fail+1)); }; fi
 if scenario auto-resume-failed; then setup auto-resume-failed; dead_but_bound; resume_error; touch "$F/wake_on_addr0"
   run '' --auto; check auto-resume-failed 0 3 'device_unbind rc=0' 'raw_read addr=0x15 rc=1' 'wake result=answers stage=read_addr_0x00' 'load_and_bind result=bound'; notes 1 'urgency=normal.*Touchpad recovered.*did not come back after resume'; fi
 if scenario auto-storm; then setup auto-storm; dead_but_bound; touch "$F/wake_on_addr0"; ticker
   run '' --auto; check auto-storm 0 4 'device_unbind' 'wake result=answers'; notes 1 'Touchpad recovered.*flooding'; fi
 if scenario auto-resume-dead; then setup auto-resume-dead; dead_but_bound; resume_error
-  run '' --auto; check auto-resume-dead 1 30 'auto_retry round=3' 'wake result=silent' '!controller_cycle'; notes 1 'Touchpad not responding.*after resume'; fi
+  run '' --auto; check auto-resume-dead 1 30 'auto_retry gave_up' 'wake result=silent' '!controller_cycle'; notes 1 'Touchpad not responding.*after resume'; fi
 if scenario auto-force; then setup auto-force; healthy
   run '' --auto --force; check auto-force 0 3 'device_unbind rc=0' 'load_and_bind result=bound' '!wake '; notes 0; fi
 if scenario auto-no-client-yet; then setup auto-no-client-yet; rm -rf "$ELAN"

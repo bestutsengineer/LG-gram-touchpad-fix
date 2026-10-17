@@ -124,7 +124,16 @@ understood.
    the first time
 3. a general-call reset (`0x06` written to `0x00`)
 
-Only the first has been needed.
+The first is what normally works. Three times, straight after a resume, the
+controller refused every stage for a while and then answered the next attempt
+within milliseconds: twice right after the third general-call reset (23 and 25
+seconds after the resume), once at the first read of the seventh attempt (60
+seconds). Its interrupt line was high when the run started and went low within
+two seconds each time. Nothing found so far (sleep length, battery, how the
+laptop was woken) tells these apart from the fast ones. Whether the reset did
+something special or the controller had only then finished starting is not
+known: a general-call reset sent to a working controller is acknowledged and
+changes nothing, and neither does a read at `0x00`.
 
 ## How the service is started
 
@@ -201,26 +210,40 @@ watcher was added.
    what a raw read returns. Pin the controller, load the driver if needed,
    wake the controller if it is silent, bind.
 5. Send one notification if the touchpad was really faulty (see below).
-6. If it is still not bound, repeat step 4 twice, five seconds apart. Every
-   successful wake so far came 28 seconds or more after the resume, so the
-   controller may not be ready for it straight away.
+6. If it is still not bound, keep waking for about three minutes: a read at
+   `0x00` every half second, a general-call reset in place of every fifth and
+   a scan in place of every twentieth, checking `0x15` after each, and bind as
+   soon as it answers. Straight after a resume the controller may not be
+   ready for the wake: the slowest recovery so far came 60 seconds after the
+   resume. Repeating step 4 instead, as earlier versions did every five
+   seconds, leaves gaps of six seconds with nothing sent. Spread out, the
+   tries cost a few milliseconds of CPU each and send no more on the bus than
+   step 4 does in the same time; the interrupt level, which takes 0.2 seconds
+   to read, is logged every 10 seconds only.
+7. If a later attempt worked after "not responding" was sent, send "Touchpad
+   recovered" in its place.
 
 It never cycles the controller, reloads modules or suspends, unless
 `--suspend` was given.
 
 ### The notification
 
-One per run, sent after the first attempt so that it can say how that went:
-"Touchpad recovered", or a critical "Touchpad not responding". It is sent only
-when a fault was actually found: a failed resume, a storm, or a controller
-that had to be woken. A touchpad that only needed its driver bound is not
-reported.
+Sent after the first attempt so that it can say how that went: "Touchpad
+recovered", or a critical "Touchpad not responding". It is sent only when a
+fault was actually found: a failed resume, a storm, or a controller that had
+to be woken. A touchpad that only needed its driver bound is not reported.
+
+When "not responding" has gone out and a later attempt, or a later run, gets
+the touchpad back, "Touchpad recovered" is sent with `notify-send
+--replace-id`, so it takes the earlier popup's place on screen. That is the
+only case with two notifications for one fault.
 
 Several triggers can fire for one fault: waking the laptop by opening the lid
 starts the unit from the sleep target and twice from the lid watcher. So a
 "not responding" notification leaves `/run/lock/tp-triage.reported` behind,
-and while that file exists later runs try again without notifying. It is
-removed as soon as the touchpad is seen working, by any run.
+holding that popup's id, and while that file exists later runs try again
+without sending another. It is removed as soon as the touchpad is seen
+working, by any run.
 
 The unit runs as root, so the notification goes through `runuser` and
 `notify-send` to the session bus of the user who owns the active graphical
@@ -346,16 +369,24 @@ changes what is sent on the bus needs a real failure to confirm it.
   command substitution standard output is a pipe.
 - **`strtonum` and `and()` are gawk functions.** They are used only for the
   interrupt-line readout, which prints `unknown` with another awk.
-- **One notification per run, and one per fault.** `FAULT` is set in two
-  places, where the fault is detected and in `wake_chip`, and `notify_fault`
-  is called once. Across runs the marker file described under "The
-  notification" does the rest; a new exit path that leaves a working touchpad
-  has to remove it.
+- **One "not responding" per fault.** `FAULT` is set in two places, where the
+  fault is detected and in `wake_chip`. `notify_fault` is called after the
+  first attempt and once more only if a later attempt succeeded while the
+  marker file described under "The notification" exists. A new exit path that
+  leaves a working touchpad has to remove that file.
 - **The lid watcher parses raw input events.** One event is 24 bytes on
   x86-64 (16 on a 32-bit kernel), and `od -w24 -tu2` turns it into one line of
   twelve words. `-v` matters, because without it `od` folds repeated lines
   into `*`, and so does `stdbuf -oL`, without which `od` holds its output back
   in a buffer.
+- **The later tries are counted, not timed.** `sleep` stops while the laptop
+  is suspended, so a run caught by a suspend carries on after it. A deadline
+  in seconds would expire at once on resume, and the resume's own start of
+  the unit is merged into the run that is still going, so nothing would check
+  the touchpad again.
+- **Reading the interrupt level is slow.** `int_level` reads the pin
+  controller's debugfs file, about 0.2 seconds each time. Keep it out of
+  anything that runs every try.
 - **The unit must wait for the kernel's own probe.** Without the two seconds
   in `needs_recovery` a unit started by udev alongside the driver load would
   unbind a touchpad that was just coming up.

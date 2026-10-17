@@ -144,8 +144,11 @@ eleven seconds after the lid is opened.
    not responding" if that first attempt did not bind it. A healthy touchpad
    sends none, and neither does one that only needed its driver bound. A
    failure that has been reported is not reported again by the next trigger.
-4. If the first attempt failed it tries twice more, five seconds apart, and
-   then gives up. It never does anything more disruptive than that.
+4. If the first attempt failed it keeps trying for about three minutes: a
+   read at `0x00` every half second, with a general-call reset every 2.5
+   seconds and a full scan every 10, then gives up. If one of those attempts
+   works, "Touchpad recovered" replaces the "not responding" notification. It
+   never does anything more disruptive than that.
 
 At boot the kernel binds the touchpad by itself when the controller answers,
 and the service then has nothing to do.
@@ -173,8 +176,10 @@ makes either mode recover even when the touchpad looks fine.
 
 - One laptop model, tested on one unit. The I2C bus number, addresses, PCI
   IDs and the pin number of the interrupt line are written into the script.
-- It is a workaround. After a bad resume the pointer is dead for a second or
-  two until the service has run.
+- It is a workaround. After a bad resume the pointer is dead until the
+  service has run: usually two to four seconds, but three times so far the
+  chip ignored every wake for 23 to 60 seconds after the resume. A manual
+  `tp-triage` during those minutes reports that the service is still running.
 - A touchpad that dies while the laptop is open and awake would not be
   noticed until the next resume or opening of the lid. That has not been seen.
 - The lid trigger was added after the second failure of that kind and has not
